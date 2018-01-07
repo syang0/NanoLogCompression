@@ -1,6 +1,13 @@
 # Random files
 ._*
+
+# Generated files
 *.o
+libsnappy.a
+benchmark
+results.txt
+count_1w100k.txt
+details/
 
 # Project files
 CMakeLists.txt

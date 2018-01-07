@@ -1,6 +1,7 @@
 #! /bin/bash
 
-git submodule init && make -j10
-./benchmark | tee results.txt
-./pivot
+git submodule update --init --recursive && make -j10; make -j10
+clear
+stdbuf -oL ./benchmark | tee results.txt
+python ./pivot.py
 gnuplot gnuplot.gnuplot
