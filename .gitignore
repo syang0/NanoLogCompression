@@ -1,0 +1,11 @@
+# Random files
+._*
+*.o
+
+# Project files
+CMakeLists.txt
+cmake-build-debug/
+nbproject/
+
+# old
+old/
