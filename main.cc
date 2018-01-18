@@ -13,6 +13,9 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+
+#include <math.h>
+
 #include <cstring>
 #include <cstdint>
 #include <cstdio>
@@ -65,9 +68,21 @@ public:
     }
 
     static double
-    randDouble(ArgumentGenerator& ag) {
-        std::uniform_real_distribution<double> doubleValDist(0, uint64_t(-1));
-        return doubleValDist(ag.generator) + 1.0/doubleValDist(ag.generator);
+    randSmallDouble(ArgumentGenerator &ag) {
+        // Will occupy at most half the exp and half the fraction
+        // https://en.wikipedia.org/wiki/Double-precision_floating-point_format
+        std::uniform_int_distribution<int> pow_dist(-32, 32);
+        std::uniform_real_distribution<double> doubleValDist(-1LL<<25, 1LL<<25);
+
+        return doubleValDist(ag.generator) + pow(2.0, pow_dist(ag.generator));
+    }
+
+    static double
+    randBigDouble(ArgumentGenerator& ag) {
+        std::uniform_int_distribution<int> pow_dist(-1023, 1023);
+        std::uniform_real_distribution<double> doubleValDist(-1LL<<52, 1LL<<52);
+
+        return doubleValDist(ag.generator) + pow(2.0, pow_dist(ag.generator));
     }
 
     template <typename T>
@@ -90,8 +105,87 @@ public:
     }
 
     static double
-    incDouble(ArgumentGenerator& ag) {
-        return ag.counter++;
+    incSmallDouble(ArgumentGenerator &ag) {
+        return ((1<<16) - 1) & ag.counter++;
+    }
+
+    static double
+    incBigDouble(ArgumentGenerator& ag) {
+        static constexpr long offset = 1LL<<32;
+        return ag.counter++ + offset;
+    }
+};
+
+/**
+ * Used to generate zipfian distributed random numbers where the distribution is
+ * skewed toward the lower integers; e.g. 0 will be the most popular, 1 the next
+ * most popular, etc.
+ *
+ * This class implements the core algorithm from YCSB's ZipfianGenerator; it, in
+ * turn, uses the algorithm from "Quickly Generating Billion-Record Synthetic
+ * Databases", Jim Gray et al, SIGMOD 1994.
+ */
+class ZipfianGenerator {
+public:
+    /**
+     * Construct a generator.  This may be expensive if n is large.
+     *
+     * \param n
+     *      The generator will output random numbers between 0 and n-1.
+     * \param theta
+     *      The zipfian parameter where 0 < theta < 1 defines the skew; the
+     *      smaller the value the more skewed the distribution will be. Default
+     *      value of 0.99 comes from the YCSB default value.
+     */
+    explicit ZipfianGenerator(uint64_t n, double theta = 0.99)
+            : n(n)
+            , theta(theta)
+            , alpha(1 / (1 - theta))
+            , zetan(zeta(n, theta))
+            , eta((1 - pow(2.0 / static_cast<double>(n), 1 - theta)) /
+                  (1 - zeta(2, theta) / zetan))
+    {}
+
+    /**
+     * Return the zipfian distributed random number between 0 and n-1.
+     */
+    uint64_t nextNumber()
+    {
+        std::uniform_int_distribution<uint64_t> distribution(0, ~0UL);
+        double u = static_cast<double>(distribution(randomness)) /
+                   static_cast<double>(~0UL);
+        double uz = u * zetan;
+        if (uz < 1)
+            return 0;
+        if (uz < 1 + std::pow(0.5, theta))
+            return 1;
+        return 0 + static_cast<uint64_t>(static_cast<double>(n) *
+                                         std::pow(eta*u - eta + 1.0, alpha));
+    }
+
+    void reset(uint64_t seed=0) {
+        randomness.seed(seed);
+    }
+
+private:
+    std::default_random_engine randomness;
+
+    const uint64_t n;       // Range of numbers to be generated.
+    const double theta;     // Parameter of the zipfian distribution.
+    const double alpha;     // Special intermediate result used for generation.
+    const double zetan;     // Special intermediate result used for generation.
+    const double eta;       // Special intermediate result used for generation.
+
+    /**
+     * Returns the nth harmonic number with parameter theta; e.g. H_{n,theta}.
+     */
+    static double zeta(uint64_t n, double theta)
+    {
+        double sum = 0;
+        for (uint64_t i = 0; i < n; i++) {
+            sum = sum + 1.0/(std::pow(i+1, theta));
+        }
+        return sum;
     }
 };
 
@@ -326,7 +420,10 @@ public:
     void stringTest(int stringLength,
                     bool runTopNWords = true,
                     long int topNWordsLimit=-1,
-                    bool runRandomStrings = false) {
+                    bool runRandomStrings = true,
+                    bool runZipfian = true,
+                    uint64_t numUniqueCharacterStrings = 100000)
+    {
         char testName[100];
         uint32_t numLogStatements;
         uint64_t rawDataLength;
@@ -366,12 +463,12 @@ public:
             while (true) {
                 std::string str;
 
-                while (str.size() < stringLength) {
+                while (str.size() <= stringLength) {
                     str += rwg.getRandomWord();
                     str += ' ';
                 }
 
-                str[stringLength - 1] = '\0';
+                str = str.substr(0, stringLength);
                 const char *args[1] = {str.c_str()};
 
                 if (!binaryLogWithArgs(&writePtr, endOfRawDataBuffer, 1, args))
@@ -384,6 +481,37 @@ public:
             snprintf(testName, sizeof(testName), "Top1000 %d Chars",
                      stringLength);
             runCompressionAlgos(testName, rawDataLength, numLogStatements);
+        }
+
+        if (runZipfian) {
+            numLogStatements = 0;
+            writePtr = rawDataBuffer;
+
+            // Here, we generate a zipfian distributed number between [0, 100000)
+            // and use it as a seed to a character generator. This would
+            // effectively give us 100000 unique strings to work with that
+            // have a zipfian distribution since the PRNG of the character
+            // produces a deterministic string.
+            ZipfianGenerator zf(numUniqueCharacterStrings);
+            std::uniform_int_distribution<char> charDist(' ', '~');
+
+            std::string myString(stringLength + 1, '\0');
+            while (true) {
+                std::default_random_engine generator(zf.nextNumber());
+                for (int i = 0; i < stringLength; ++i)
+                    myString[i] = charDist(generator);
+
+                const char *args[1] = { myString.c_str() };
+                if (!binaryLogWithArgs(&writePtr, endOfRawDataBuffer, 1, args))
+                    break;
+
+                ++numLogStatements;
+            }
+
+            rawDataLength = writePtr - rawDataBuffer;
+            snprintf(testName, sizeof(testName), "zipf100k %d Chars",
+                     stringLength);
+            runCompressionAlgos(testName, rawDataLength, numLogStatements   );
         }
     }
 private:
@@ -428,6 +556,7 @@ private:
             int compressionLevels[] = {0, 1, 6, 9};
 
             for (int level : compressionLevels) {
+                bzero(compressedOutputBuffer, compressedBufferSize);
                 start = Cycles::rdtsc();
                 compressedLength = compressedBufferSize;
 
@@ -454,6 +583,7 @@ private:
 
         // Memcpy
         if (runMemcpy) {
+            bzero(compressedOutputBuffer, compressedBufferSize);
             start = Cycles::rdtsc();
             memcpy(compressedOutputBuffer, rawDataBuffer, rawDataLength);
             stop = Cycles::rdtsc();
@@ -467,6 +597,7 @@ private:
 
         // Snappy
         if (runSnappy) {
+            bzero(compressedOutputBuffer, compressedBufferSize);
             start = Cycles::rdtsc();
             compressedLength = compressedBufferSize;
             snappy::RawCompress((char *) rawDataBuffer,
@@ -484,6 +615,7 @@ private:
 
 
         if (runNanoLog) {
+            bzero(compressedOutputBuffer, compressedBufferSize);
             start = Cycles::rdtsc();
             compressedLength = compressedBufferSize;
             NanoLogCompress2(compressedOutputBuffer, &compressedLength,
@@ -552,7 +684,7 @@ int main(int argc, char **argv) {
     // First, run all the binary data types (int/long/doubles)
     char datasetName[100];
     int numberOfArguments[] = {1, 2, 3, 4, 6, 10};
-    for (int numArgs : numberOfArguments) {
+     for (int numArgs : numberOfArguments) {
         // Random Arguments
         snprintf(datasetName, 100, "Rand Small %d Int", numArgs);
         runner.runBinaryTest(datasetName, numArgs,
@@ -570,18 +702,18 @@ int main(int argc, char **argv) {
         runner.runBinaryTest(datasetName, numArgs,
                              &ArgumentGenerator::randBigInt<long>);
 
-        snprintf(datasetName, 100, "Rand %d Double", numArgs);
+        snprintf(datasetName, 100, "Rand Small %d Double", numArgs);
         runner.runBinaryTest(datasetName, numArgs,
-                             &ArgumentGenerator::randDouble);
+                             &ArgumentGenerator::randSmallDouble);
+
+        snprintf(datasetName, 100, "Rand Big %d Double", numArgs);
+        runner.runBinaryTest(datasetName, numArgs,
+                             &ArgumentGenerator::randBigDouble);
 
         // Incremented Arguments
         snprintf(datasetName, 100, "Incr Small %d Int", numArgs);
         runner.runBinaryTest(datasetName, numArgs,
                              &ArgumentGenerator::incSmallInt<int>);
-
-        snprintf(datasetName, 100, "Incr Reg %d Int", numArgs);
-        runner.runBinaryTest(datasetName, numArgs,
-                             &ArgumentGenerator::incRegInt<int>);
 
         snprintf(datasetName, 100, "Incr Big %d Int", numArgs);
         runner.runBinaryTest(datasetName, numArgs,
@@ -591,26 +723,25 @@ int main(int argc, char **argv) {
         runner.runBinaryTest(datasetName, numArgs,
                              &ArgumentGenerator::incSmallInt<long>);
 
-        snprintf(datasetName, 100, "Incr Reg %d Long", numArgs);
-        runner.runBinaryTest(datasetName, numArgs,
-                             &ArgumentGenerator::incRegInt<long>);
-
         snprintf(datasetName, 100, "Incr Big %d Long", numArgs);
         runner.runBinaryTest(datasetName, numArgs,
                              &ArgumentGenerator::incBigInt<long>);
 
-        snprintf(datasetName, 100, "Incr %d Double", numArgs);
+        snprintf(datasetName, 100, "Incr Small %d Double", numArgs);
         runner.runBinaryTest(datasetName, numArgs,
-                             &ArgumentGenerator::incDouble);
-    }
+                             &ArgumentGenerator::incSmallDouble);
+
+        snprintf(datasetName, 100, "Incr Big %d Double", numArgs);
+        runner.runBinaryTest(datasetName, numArgs,
+                             &ArgumentGenerator::incBigDouble);
+     }
 
     // Run the ASCII tests, varying...
     // 1) string length (say 10, 20, 40)
     // 2) entropy (psuedo-random words by top 1000)
-
     int stringLengths[] = {10, 20, 40};
     for (int length : stringLengths) {
-        runner.stringTest(length, 1000);
+        runner.stringTest(length, true, 1000);
     }
 
     fflush(stdout);
