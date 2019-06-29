@@ -57,22 +57,28 @@ def runBandwidthCalculations(dataset2results, listOfAlgorithms, filename):
     os.makedirs(logDir)
 
   with open(logDir + "/" + filename + '.txt', 'w') as oFile, \
-       open(logDir + "/" + filename + "-detailed.dat", 'w') as dFile:
+       open(logDir + "/" + filename + "-detailed.dat", 'w') as dFile, \
+       open(logDir + "/" + filename + "-absolute.txt", 'w') as aFile:
     lastBestAlgo = "dummy"
     datsetsConsidered = set()
 
     print "Running Bandwith Calculations for %s" % filename
 
     oFile.write("%-10s" % "MB/s")
+    aFile.write("%-10s" % "MB/s")
     for algorithm in listOfAlgorithms:
-      oFile.write("%10s" % algorithm)
-    oFile.write("\r\n");
+      oFile.write("%15s" % algorithm)
+      aFile.write("%15s" % algorithm)
+    oFile.write("\r\n")
+    aFile.write("\r\n")
 
     lastWins = {}
     for bandwidthMBs in range(1,500, 1) + range(500, 5000, 50)  + range(5000, 100000, 100):
       wins = {}
+      totalOutputTime = {}
       for algorithm in listOfAlgorithms:
         wins[algorithm] = []
+        totalOutputTime[algorithm] = 0.0
 
       for dataset in dataset2results:
         datsetsConsidered.add(dataset)
@@ -84,11 +90,12 @@ def runBandwidthCalculations(dataset2results, listOfAlgorithms, filename):
             continue
 
           computeTime = float(result.computeTime)
-          outputTime = float(result.outputBytes)/(bandwidthMBs*1024*1024)
-          maxTime = max(computeTime, outputTime)
+          ioTime = float(result.outputBytes)/(bandwidthMBs*1024*1024)
+          outputTime = max(computeTime, ioTime)
+          totalOutputTime[result.algorithm] = totalOutputTime[result.algorithm] + outputTime
 
-          if bestAlgoTime > maxTime:
-            bestAlgoTime = maxTime
+          if bestAlgoTime > outputTime:
+            bestAlgoTime = outputTime
             bestAlgo = result.algorithm
 
         wins[bestAlgo].append(dataset)
@@ -98,17 +105,20 @@ def runBandwidthCalculations(dataset2results, listOfAlgorithms, filename):
       bestAlgoCnt = -1
 
       oFile.write("%-10d" % bandwidthMBs)
+      aFile.write("%-10d" % bandwidthMBs)
       for algorithm in listOfAlgorithms:
         if len(wins[algorithm]) > bestAlgoCnt:
           bestAlgoCnt = len(wins[algorithm])
           bestAlgo = algorithm
 
-        oFile.write("%10d" % len(wins[algorithm]))
+        oFile.write("%15d" % len(wins[algorithm]))
+        aFile.write("%15s" % ("%8.6f" % totalOutputTime[algorithm]))
       oFile.write("\r\n")
+      aFile.write("\r\n")
 
       # output detailed file
       if lastWins != wins:
-        dFile.write("%-10d\r\n" % bandwidthMBs)
+        dFile.write("Bandwidth: %-10d\r\n" % bandwidthMBs)
         winCounts = [len(v) for k, v in wins.iteritems()]
         winCounts = sorted(winCounts, reverse=True)
 
@@ -119,6 +129,10 @@ def runBandwidthCalculations(dataset2results, listOfAlgorithms, filename):
           for k,v in wins.iteritems():
             if len(v) == winCount:
               dFile.write("\t%s:%s\r\n\r\n" % (k, sorted(v)))
+
+        dFile.write("Total Output Times(s)\r\n")
+        for k,v in totalOutputTime.iteritems():
+          dFile.write("%10s:%10d\r\n" % (k, v))
         dFile.write("\r\n")
 
 
@@ -230,7 +244,13 @@ with open("results.txt", 'r') as iFile:
 
 
 # Analysis part
-algorithms.remove("NL+snappy")
+# algorithms.remove("NL+snappy")
+algorithms.remove("gzip,1+s")
+algorithms.remove("gzip,6+s")
+algorithms.remove("gzip,9+s")
+algorithms.remove("s+gzip,1")
+algorithms.remove("s+gzip,6")
+algorithms.remove("s+gzip,9")
 listOfAllAlgorithms = sorted(list(algorithms))
 print listOfAllAlgorithms
 

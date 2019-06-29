@@ -204,6 +204,9 @@ class BenchmarkRunner {
     // Stores the compressed log data
     unsigned char *compressedOutputBuffer;
 
+    // Stores output data that's compressed a second time
+    unsigned char *doubleCompressedOutputBuffer;
+
     // Stores the sizes of the two buffers above
     unsigned long int rawBufferSize;
     unsigned long int compressedBufferSize;
@@ -307,6 +310,7 @@ public:
             : rawDataBuffer(nullptr)
             , endOfRawDataBuffer(nullptr)
             , compressedOutputBuffer(nullptr)
+            , doubleCompressedOutputBuffer(nullptr)
             , rawBufferSize(bufferSize)
             , compressedBufferSize(2*bufferSize)
             , argumentGenerator()
@@ -315,7 +319,12 @@ public:
         compressedOutputBuffer = static_cast<unsigned char*>(
                                                   malloc(compressedBufferSize));
 
-        if (rawDataBuffer == nullptr || compressedOutputBuffer == nullptr) {
+        doubleCompressedOutputBuffer = static_cast<unsigned char*>(
+                                                  malloc(compressedBufferSize));
+
+        if (rawDataBuffer == nullptr
+                || compressedOutputBuffer == nullptr
+                || doubleCompressedOutputBuffer == nullptr) {
             fprintf(stderr, "Could not allocate input/output buffers of "
                     "size %lu and %lu bytes for compression\r\n",
                     rawBufferSize, compressedBufferSize);
@@ -324,6 +333,7 @@ public:
 
         bzero(rawDataBuffer, rawBufferSize);
         bzero(compressedOutputBuffer, compressedBufferSize);
+        bzero(doubleCompressedOutputBuffer, compressedBufferSize);
         endOfRawDataBuffer = rawDataBuffer + bufferSize;
     }
 
@@ -336,6 +346,9 @@ public:
             free(compressedOutputBuffer);
         compressedOutputBuffer = nullptr;
 
+        if (doubleCompressedOutputBuffer != nullptr)
+            free(doubleCompressedOutputBuffer);
+        doubleCompressedOutputBuffer = nullptr;
     }
 
     /**
@@ -548,14 +561,16 @@ private:
                         bool runGzip = true,
                         bool runNanoLog = true)
     {
+
+        char testName[100];
+        int gzipCompressionLevels[] = {1, 6, 9};
+
         std::vector<Result> results;
-        uint64_t start, stop, compressionCycles, compressedLength;
+        uint64_t start, stop, firstCompressionCycles, secondCompressionCycles;
+        uint64_t compressedLength;
 
         if (runGzip) {
-            char testName[100];
-            int compressionLevels[] = {0, 1, 6, 9};
-
-            for (int level : compressionLevels) {
+            for (int level : gzipCompressionLevels) {
                 bzero(compressedOutputBuffer, compressedBufferSize);
                 start = Cycles::rdtsc();
                 compressedLength = compressedBufferSize;
@@ -564,7 +579,7 @@ private:
                                        rawDataBuffer, rawDataLength,
                                        level);
                 stop = Cycles::rdtsc();
-                compressionCycles = stop - start;
+                firstCompressionCycles = stop - start;
 
                 snprintf(testName, sizeof(testName), "gzip,%d", level);
 
@@ -575,9 +590,31 @@ private:
                 }
 
                 Result r(testName, datasetName, rawDataLength, compressedLength,
-                         numLogStatements, compressionCycles);
+                         numLogStatements, firstCompressionCycles);
                 r.print();
                 results.push_back(r);
+
+                if (runSnappy) {
+                    unsigned long int snappyOutputBytes = compressedBufferSize;
+                    bzero(doubleCompressedOutputBuffer, compressedBufferSize);
+
+                    start = Cycles::rdtsc();
+                    snappy::RawCompress((char *) compressedOutputBuffer,
+                                        compressedLength,
+                                        (char *) doubleCompressedOutputBuffer,
+                                        &snappyOutputBytes);
+                    stop = Cycles::rdtsc();
+                    secondCompressionCycles =
+                            firstCompressionCycles + stop - start;
+
+                    snprintf(testName, sizeof(testName), "gzip,%d+s", level);
+
+                    Result r(testName, datasetName, rawDataLength,
+                             snappyOutputBytes, numLogStatements,
+                             secondCompressionCycles);
+                    r.print();
+                    results.push_back(r);
+                }
             }
         }
 
@@ -587,10 +624,10 @@ private:
             start = Cycles::rdtsc();
             memcpy(compressedOutputBuffer, rawDataBuffer, rawDataLength);
             stop = Cycles::rdtsc();
-            compressionCycles = stop - start;
+            firstCompressionCycles = stop - start;
 
             Result r("memcpy", datasetName, rawDataLength, rawDataLength,
-                     numLogStatements, compressionCycles);
+                     numLogStatements, firstCompressionCycles);
             r.print();
             results.push_back(r);
         }
@@ -605,12 +642,44 @@ private:
                                 (char *) compressedOutputBuffer,
                                 &compressedLength);
             stop = Cycles::rdtsc();
-            compressionCycles = stop - start;
+            firstCompressionCycles = stop - start;
 
             Result r("snappy", datasetName, rawDataLength, compressedLength,
-                     numLogStatements, compressionCycles);
+                     numLogStatements, firstCompressionCycles);
             r.print();
             results.push_back(r);
+
+            if (runGzip) {
+                for (int level : gzipCompressionLevels) {
+                    unsigned long int gzipOutputBytes = compressedBufferSize;
+                    bzero(doubleCompressedOutputBuffer, compressedBufferSize);
+
+                    start = Cycles::rdtsc();
+                    int retVal = compress2(doubleCompressedOutputBuffer,
+                                           &gzipOutputBytes,
+                                           compressedOutputBuffer,
+                                           compressedLength,
+                                           level);
+                    stop = Cycles::rdtsc();
+                    secondCompressionCycles =
+                            firstCompressionCycles + stop - start;
+
+                    snprintf(testName, sizeof(testName), "s+gzip,%d", level);
+
+                    if (retVal != Z_OK) {
+                        fprintf(stderr,
+                                "Compression scheme %s with input \"%s\" "
+                                        "failed with error code %d\r\n",
+                                testName, datasetName, retVal);
+                    }
+
+                    Result r(testName, datasetName, rawDataLength,
+                             gzipOutputBytes, numLogStatements,
+                             secondCompressionCycles);
+                    r.print();
+                    results.push_back(r);
+                }
+            }
         }
 
 
@@ -621,33 +690,62 @@ private:
             NanoLogCompress2(compressedOutputBuffer, &compressedLength,
                              rawDataBuffer, rawDataLength);
             stop = Cycles::rdtsc();
-            compressionCycles = stop - start;
+            firstCompressionCycles = stop - start;
 
             Result r("NanoLog", datasetName, rawDataLength, compressedLength,
-                     numLogStatements, compressionCycles);
+                     numLogStatements, firstCompressionCycles);
             r.print();
             results.push_back(r);
 
             if (runSnappy) {
                 unsigned long int snappyOutputBytes = compressedBufferSize;
-                unsigned char *snappyOutputBuffer = static_cast<unsigned char*>(
-                        malloc(compressedBufferSize));
-                bzero(snappyOutputBuffer, compressedBufferSize);
+                bzero(doubleCompressedOutputBuffer, compressedBufferSize);
 
                 start = Cycles::rdtsc();
                 snappy::RawCompress((char *) compressedOutputBuffer,
                                     compressedLength,
-                                    (char *) snappyOutputBuffer,
+                                    (char *) doubleCompressedOutputBuffer,
                                     &snappyOutputBytes);
                 stop = Cycles::rdtsc();
-                compressionCycles += stop - start;
+                secondCompressionCycles = firstCompressionCycles + stop - start;
 
                 Result r("NL+snappy", datasetName, rawDataLength,
-                         snappyOutputBytes, numLogStatements, compressionCycles);
+                         snappyOutputBytes, numLogStatements,
+                         secondCompressionCycles);
                 r.print();
                 results.push_back(r);
+            }
 
-                free(snappyOutputBuffer);
+            if (runGzip) {
+                for (int level : gzipCompressionLevels) {
+                    unsigned long int gzipOutputBytes = compressedBufferSize;
+                    bzero(doubleCompressedOutputBuffer, compressedBufferSize);
+
+                    start = Cycles::rdtsc();
+                    int retVal = compress2(doubleCompressedOutputBuffer,
+                                           &gzipOutputBytes,
+                                           compressedOutputBuffer,
+                                           compressedLength,
+                                           level);
+                    stop = Cycles::rdtsc();
+                    secondCompressionCycles =
+                            firstCompressionCycles + stop - start;
+
+                    snprintf(testName, sizeof(testName), "NL+gzip,%d", level);
+
+                    if (retVal != Z_OK) {
+                        fprintf(stderr,
+                                "Compression scheme %s with input \"%s\" "
+                                        "failed with error code %d\r\n",
+                                testName, datasetName, retVal);
+                    }
+
+                    Result r(testName, datasetName, rawDataLength,
+                             gzipOutputBytes, numLogStatements,
+                             secondCompressionCycles);
+                    r.print();
+                    results.push_back(r);
+                }
             }
         }
 
@@ -739,7 +837,7 @@ int main(int argc, char **argv) {
     // Run the ASCII tests, varying...
     // 1) string length (say 10, 20, 40)
     // 2) entropy (psuedo-random words by top 1000)
-    int stringLengths[] = {10, 20, 40};
+    int stringLengths[] = {10, 15, 20, 30, 45, 60, 100};
     for (int length : stringLengths) {
         runner.stringTest(length, true, 1000);
     }
